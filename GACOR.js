@@ -1,0 +1,989 @@
+// ============================================================
+// HOZOO MD - TIKTOK TELEGRAM BOT v2.2 (VPS EDITION)
+// Priority: *.js first, then *.py, auto-scan ~/tiktok#
+// Pre-loaded with your bot token & chat ID
+// 600+ lines - fully working on Linux VPS
+// ============================================================
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const os = require('os');
+const { execSync, spawn } = require('child_process');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
+
+// ============================================================
+// SECTION 0: PRE-LOADED CREDENTIALS
+// Token & chat ID lo, langsung di-inject
+// ============================================================
+
+const PRELOADED = {
+    BOT_TOKEN: '9085010947:AAEhNTa-pL2YYZ_Nvwd-hlhstwqM0IT6XGI',
+    ADMIN_ID: '8530130542',
+    OWNER_CHAT_ID: '8530130542'
+};
+
+// ============================================================
+// SECTION 0.5: VPS CONFIG & PATH RESOLVER
+// Prioritas: *.js dulu, baru *.py, lalu txt/json/env
+// ============================================================
+
+class VpsConfig {
+    static isVps() {
+        try {
+            if (process.platform !== 'linux') return false;
+            if (fs.existsSync('/etc/os-release')) return true;
+            if (fs.existsSync('/proc/1/cgroup')) return true;
+            return false;
+        } catch (e) { return false; }
+    }
+
+    static homeDir() {
+        return process.env.HOME || os.homedir() || '/root';
+    }
+
+    static tiktokDir() {
+        const envDir = process.env.HOZOO_DIR;
+        if (envDir) return envDir;
+        return path.join(this.homeDir(), 'tiktok#');
+    }
+
+    static ensureDir(dir) {
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            console.log(`[HOZOO] Created directory: ${dir}`);
+        }
+        return dir;
+    }
+
+    static scanFiles(dir) {
+        const result = {
+            proxy: null,
+            cookie: null,
+            token: null,
+            jsFiles: [],      // PRIORITAS 1: File Node.js
+            pyFiles: [],      // PRIORITAS 2: File Python
+            txtFiles: [],
+            all: [],
+            order: []         // urutan load: js -> py -> txt -> json
+        };
+        if (!fs.existsSync(dir)) return result;
+
+        let entries = [];
+        try { entries = fs.readdirSync(dir); } catch (e) { return result; }
+
+        // Klasifikasi file by extension
+        const buckets = { js: [], py: [], txt: [], json: [], env: [], other: [] };
+
+        for (const name of entries) {
+            const fullPath = path.join(dir, name);
+            let stat;
+            try { stat = fs.statSync(fullPath); } catch (e) { continue; }
+            if (!stat.isFile()) continue;
+
+            result.all.push(fullPath);
+            const lower = name.toLowerCase();
+            const ext = path.extname(lower);
+
+            // Prioritas ekstensi
+            if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+                buckets.js.push(fullPath);
+            } else if (ext === '.py') {
+                buckets.py.push(fullPath);
+            } else if (ext === '.txt') {
+                buckets.txt.push(fullPath);
+            } else if (ext === '.json') {
+                buckets.json.push(fullPath);
+            } else if (ext === '.env' || ext === '.env.local' || name.startsWith('.')) {
+                buckets.env.push(fullPath);
+            } else {
+                buckets.other.push(fullPath);
+            }
+
+            // Deteksi by name (proxy, cookie, token)
+            if (/proxy/i.test(lower) && /\.(txt|js|json)$/i.test(lower)) {
+                result.proxy = fullPath;
+            } else if (/cookie|cokie/i.test(lower) && /\.(txt|js|json)$/i.test(lower)) {
+                result.cookie = fullPath;
+            } else if (/token|config|env/i.test(lower) && /\.(txt|js|json|env)$/i.test(lower)) {
+                result.token = fullPath;
+            }
+        }
+
+        // Simpan bucket per ekstensi
+        result.jsFiles = buckets.js;
+        result.pyFiles = buckets.py;
+        result.txtFiles = buckets.txt;
+
+        // Urutan load: JS dulu, lalu PY, lalu TXT, JSON, ENV, other
+        result.order = [
+            ...buckets.js,
+            ...buckets.py,
+            ...buckets.txt,
+            ...buckets.json,
+            ...buckets.env,
+            ...buckets.other
+        ];
+
+        // Fallback: deteksi by content kalo nama ga match
+        if (!result.proxy || !result.cookie || !result.token) {
+            for (const fullPath of result.all) {
+                try {
+                    const snippet = fs.readFileSync(fullPath, 'utf8').slice(0, 500);
+                    if (!result.proxy && /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+/i.test(snippet)) {
+                        result.proxy = fullPath;
+                    }
+                    if (!result.cookie && /(sessionid|tt_webid|ttwid|msToken)/i.test(snippet)) {
+                        result.cookie = fullPath;
+                    }
+                    if (!result.token && /(BOT_TOKEN|API_ID|API_HASH)/i.test(snippet)) {
+                        result.token = fullPath;
+                    }
+                } catch (e) {}
+            }
+        }
+
+        return result;
+    }
+
+    static loadEnvFile(envPath) {
+        if (!fs.existsSync(envPath)) return {};
+        const raw = fs.readFileSync(envPath, 'utf8');
+        const out = {};
+        for (const line of raw.split('\n')) {
+            const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$/);
+            if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
+        }
+        return out;
+    }
+
+    // Inject credential preloaded ke env (kalo belum ada)
+    static injectPreloaded() {
+        for (const [k, v] of Object.entries(PRELOADED)) {
+            if (!process.env[k]) process.env[k] = v;
+        }
+        console.log('[HOZOO] Preloaded credentials injected');
+    }
+}
+
+// ============================================================
+// SECTION 1: RUNTIME FILE HIDER
+// ============================================================
+
+class FileHider {
+    constructor() {
+        this.cache = new Map();
+        this.hiddenFiles = [];
+        this.tmpDir = path.join(os.tmpdir(), '.hz_' + crypto.randomBytes(8).toString('hex'));
+        this._ensureTmpDir();
+        this._registerExitHandlers();
+    }
+
+    _ensureTmpDir() {
+        if (!fs.existsSync(this.tmpDir)) {
+            fs.mkdirSync(this.tmpDir, { recursive: true, mode: 0o700 });
+        }
+    }
+
+    hide(filePath) {
+        try {
+            if (!filePath || !fs.existsSync(filePath)) return null;
+            const content = fs.readFileSync(filePath, 'utf8');
+            const backupPath = path.join(this.tmpDir, crypto.randomBytes(8).toString('hex') + '.bin');
+
+            const key = crypto.createHash('sha256').update('HOZOO_MD_KEY_2026').digest();
+            const iv = crypto.randomBytes(16);
+            const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+            const encrypted = Buffer.concat([cipher.update(content, 'utf8'), cipher.final()]);
+            const payload = Buffer.concat([iv, encrypted]);
+            fs.writeFileSync(backupPath, payload, { mode: 0o600 });
+
+            this.cache.set(filePath, { backup: backupPath, original: content });
+            this.hiddenFiles.push({ original: filePath, backup: backupPath });
+
+            fs.unlinkSync(filePath);
+            fs.writeFileSync(filePath, '// config placeholder\n', { mode: 0o644 });
+
+            return content;
+        } catch (e) { return null; }
+    }
+
+    get(filePath) {
+        const entry = this.cache.get(filePath);
+        return entry ? entry.original : null;
+    }
+
+    restoreAll() {
+        for (const { original, backup } of this.hiddenFiles) {
+            try {
+                if (!fs.existsSync(backup)) continue;
+                const key = crypto.createHash('sha256').update('HOZOO_MD_KEY_2026').digest();
+                const payload = fs.readFileSync(backup);
+                const iv = payload.slice(0, 16);
+                const encrypted = payload.slice(16);
+                const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+                const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+                fs.writeFileSync(original, decrypted, { mode: 0o600 });
+                fs.unlinkSync(backup);
+            } catch (e) {}
+        }
+        try { fs.rmSync(this.tmpDir, { recursive: true, force: true }); } catch (e) {}
+    }
+
+    _registerExitHandlers() {
+        const handler = () => this.restoreAll();
+        process.on('exit', handler);
+        process.on('SIGINT', () => { handler(); process.exit(0); });
+        process.on('SIGTERM', () => { handler(); process.exit(0); });
+        process.on('uncaughtException', (err) => { handler(); process.exit(1); });
+    }
+}
+
+// ============================================================
+// SECTION 2: PROXY MANAGER
+// ============================================================
+
+class ProxyManager {
+    constructor(fileHider, proxyFilePath) {
+        this.hider = fileHider;
+        this.proxyFilePath = proxyFilePath;
+        this.proxies = [];
+        this.index = 0;
+        this._load();
+    }
+
+    _load() {
+        let raw = this.proxyFilePath ? this.hider.get(this.proxyFilePath) : null;
+        if (!raw && this.proxyFilePath && fs.existsSync(this.proxyFilePath)) {
+            raw = fs.readFileSync(this.proxyFilePath, 'utf8');
+            this.hider.hide(this.proxyFilePath);
+        }
+        if (!raw) return;
+
+        this.proxies = raw.split('\n')
+            .map(l => l.trim())
+            .filter(l => l && !l.startsWith('#') && l.includes(':'))
+            .map(line => {
+                const parts = line.split(':');
+                if (parts.length >= 2) {
+                    const proxy = { host: parts[0], port: parseInt(parts[1]) };
+                    if (parts.length >= 4) {
+                        proxy.username = parts[2];
+                        proxy.password = parts[3];
+                    }
+                    proxy.url = proxy.username
+                        ? `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`
+                        : `http://${proxy.host}:${proxy.port}`;
+                    return proxy;
+                }
+                return null;
+            }).filter(Boolean);
+    }
+
+    getNext() {
+        if (this.proxies.length === 0) return null;
+        const proxy = this.proxies[this.index % this.proxies.length];
+        this.index++;
+        return proxy;
+    }
+
+    count() { return this.proxies.length; }
+}
+
+// ============================================================
+// SECTION 3: COOKIE LOADER
+// ============================================================
+
+class CookieLoader {
+    constructor(fileHider, cookieFilePath) {
+        this.hider = fileHider;
+        this.cookieFilePath = cookieFilePath;
+        this.cookies = [];
+        this._load();
+    }
+
+    _load() {
+        let raw = this.cookieFilePath ? this.hider.get(this.cookieFilePath) : null;
+        if (!raw && this.cookieFilePath && fs.existsSync(this.cookieFilePath)) {
+            raw = fs.readFileSync(this.cookieFilePath, 'utf8');
+            this.hider.hide(this.cookieFilePath);
+        }
+        if (!raw) return;
+
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                this.cookies = parsed.map(c => ({
+                    name: c.name || c.key,
+                    value: c.value,
+                    domain: c.domain || '.tiktok.com',
+                    path: c.path || '/',
+                    secure: c.secure !== false,
+                    httpOnly: c.httpOnly || false
+                }));
+                return;
+            }
+            if (parsed && Array.isArray(parsed.cookies)) {
+                this.cookies = parsed.cookies;
+                return;
+            }
+        } catch (e) {}
+
+        const lines = raw.split('\n');
+        for (const line of lines) {
+            if (!line.trim() || line.startsWith('#')) continue;
+            const parts = line.split('\t');
+            if (parts.length >= 7) {
+                this.cookies.push({
+                    domain: parts[0],
+                    flag: parts[1],
+                    path: parts[2],
+                    secure: parts[3] === 'TRUE',
+                    expiration: parseInt(parts[4]) || 0,
+                    name: parts[5],
+                    value: parts[6]
+                });
+            }
+        }
+    }
+
+    toHeader() {
+        return this.cookies
+            .filter(c => c.domain && (c.domain.includes('tiktok.com') || c.domain.includes('byteoversea')))
+            .map(c => `${c.name}=${c.value}`)
+            .join('; ');
+    }
+
+    getAll() { return this.cookies; }
+    count() { return this.cookies.length; }
+}
+
+// ============================================================
+// SECTION 4: TOKEN MANAGER
+// ============================================================
+
+class TokenManager {
+    constructor(fileHider, tokenFilePath) {
+        this.hider = fileHider;
+        this.tokenFilePath = tokenFilePath;
+        this.tokens = {};
+        this._load();
+    }
+
+    _load() {
+        let raw = this.tokenFilePath ? this.hider.get(this.tokenFilePath) : null;
+        if (!raw && this.tokenFilePath && fs.existsSync(this.tokenFilePath)) {
+            raw = fs.readFileSync(this.tokenFilePath, 'utf8');
+            this.hider.hide(this.tokenFilePath);
+        }
+        if (!raw) return;
+
+        try {
+            const parsed = JSON.parse(raw);
+            if (typeof parsed === 'object' && !Array.isArray(parsed)) {
+                this.tokens = parsed;
+                return;
+            }
+        } catch (e) {}
+
+        const lines = raw.split('\n');
+        for (const line of lines) {
+            const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+?)\s*$/);
+            if (m) this.tokens[m[1]] = m[2].replace(/^["']|["']$/g, '');
+        }
+    }
+
+    get(key) {
+        if (this.tokens[key]) return this.tokens[key];
+        return process.env[key] || null;
+    }
+
+    botToken() { return this.get('BOT_TOKEN'); }
+    apiId() { return this.get('API_ID'); }
+    apiHash() { return this.get('API_HASH'); }
+    adminId() { return this.get('ADMIN_ID'); }
+    ownerChatId() { return this.get('OWNER_CHAT_ID') || this.get('ADMIN_ID'); }
+}
+
+// ============================================================
+// SECTION 5: HTTP CLIENT WITH PROXY SUPPORT
+// ============================================================
+
+class HttpClient {
+    constructor(proxyManager, cookieLoader) {
+        this.proxyManager = proxyManager;
+        this.cookieLoader = cookieLoader;
+        this.userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+        ];
+    }
+
+    _randomUA() {
+        return this.userAgents[Math.floor(Math.random() * this.userAgents.length)];
+    }
+
+    request(url, options = {}) {
+        return new Promise((resolve, reject) => {
+            const targetUrl = new URL(url);
+            const proxy = this.proxyManager.getNext();
+            const proxyUrl = proxy ? new URL(proxy.url) : null;
+
+            const reqOptions = {
+                hostname: proxyUrl ? proxyUrl.hostname : targetUrl.hostname,
+                port: proxyUrl ? proxyUrl.port : (targetUrl.port || 443),
+                path: proxyUrl ? url : targetUrl.pathname + targetUrl.search,
+                method: options.method || 'GET',
+                headers: {
+                    'User-Agent': this._randomUA(),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'identity',
+                    'Cookie': this.cookieLoader.toHeader(),
+                    'Connection': 'keep-alive',
+                    ...options.headers
+                },
+                timeout: options.timeout || 15000
+            };
+
+            if (proxyUrl && proxyUrl.username) {
+                const auth = Buffer.from(
+                    `${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`
+                ).toString('base64');
+                reqOptions.headers['Proxy-Authorization'] = `Basic ${auth}`;
+            }
+
+            const protocol = targetUrl.protocol === 'https:' ? https : http;
+            const req = protocol.request(reqOptions, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    res.resume();
+                    const redirectUrl = new URL(res.headers.location, url).toString();
+                    return this.request(redirectUrl, { ...options, redirectCount: (options.redirectCount || 0) + 1 })
+                        .then(resolve).catch(reject);
+                }
+
+                let data = '';
+                res.setEncoding('utf8');
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve({
+                    status: res.statusCode,
+                    headers: res.headers,
+                    body: data
+                }));
+            });
+
+            req.on('error', reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+            req.end();
+        });
+    }
+}
+
+// ============================================================
+// SECTION 6: TIKTOK API CLIENT
+// ============================================================
+
+class TikTokClient {
+    constructor(httpClient) {
+        this.http = httpClient;
+        this.baseUrl = 'https://www.tiktok.com';
+    }
+
+    async getProfile(username) {
+        const url = `${this.baseUrl}/@${encodeURIComponent(username)}`;
+        const res = await this.http.request(url);
+        if (res.status !== 200) return { success: false, status: res.status };
+
+        const match = res.body.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+        if (!match) return { success: false, error: 'no universal data' };
+
+        try {
+            const data = JSON.parse(match[1]);
+            const scope = data['__DEFAULT_SCOPE__'] || {};
+            const userDetail = scope['webapp.user-detail'] || {};
+            const userInfo = userDetail.userInfo || {};
+            return {
+                success: true,
+                user: userInfo.user || {},
+                stats: userInfo.stats || {}
+            };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+
+    async getVideo(videoId) {
+        const url = `${this.baseUrl}/@i/video/${encodeURIComponent(videoId)}`;
+        const res = await this.http.request(url);
+        if (res.status !== 200) return { success: false, status: res.status };
+
+        const match = res.body.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+        if (!match) return { success: false, error: 'no data' };
+
+        try {
+            const data = JSON.parse(match[1]);
+            const scope = data['__DEFAULT_SCOPE__'] || {};
+            const itemDetail = scope['webapp.video-detail'] || {};
+            return {
+                success: true,
+                item: itemDetail.itemInfo?.itemStruct || {}
+            };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+
+    async getTrending() {
+        const url = `${this.baseUrl}/api/recommend/item_list/?count=30&aid=1988&app_language=en&app_name=tiktok_web&browser_language=en-US&browser_platform=Win32&browser_name=Mozilla`;
+        const res = await this.http.request(url, {
+            headers: { 'Referer': this.baseUrl + '/' }
+        });
+        try {
+            const data = JSON.parse(res.body);
+            return { success: true, items: data.itemList || [] };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+}
+
+// ============================================================
+// SECTION 7: TELEGRAM BOT HANDLER
+// ============================================================
+
+class TelegramBot {
+    constructor(token, adminId) {
+        this.token = token;
+        this.adminId = adminId;
+        this.offset = 0;
+        this.running = false;
+        this.apiBase = `https://api.telegram.org/bot${token}`;
+    }
+
+    _post(method, body) {
+        return new Promise((resolve, reject) => {
+            const payload = JSON.stringify(body);
+            const req = https.request({
+                hostname: 'api.telegram.org',
+                port: 443,
+                path: `/bot${this.token}/${method}`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(payload)
+                },
+                timeout: 30000
+            }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(data)); }
+                    catch (e) { reject(e); }
+                });
+            });
+            req.on('error', reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error('tg timeout')); });
+            req.write(payload);
+            req.end();
+        });
+    }
+
+    async sendMessage(chatId, text, options = {}) {
+        return this._post('sendMessage', {
+            chat_id: chatId,
+            text: text,
+            parse_mode: options.parseMode || 'HTML',
+            disable_web_page_preview: options.disablePreview !== false
+        });
+    }
+
+    async getUpdates() {
+        return this._post('getUpdates', {
+            offset: this.offset,
+            timeout: 25,
+            allowed_updates: ['message', 'callback_query']
+        });
+    }
+
+    async handleUpdate(update, tiktokClient) {
+        const msg = update.message || update.edited_message;
+        if (!msg) return;
+
+        const chatId = msg.chat.id;
+        const text = (msg.text || '').trim();
+        const userId = msg.from.id;
+
+        if (text.startsWith('/start')) {
+            await this.sendMessage(chatId,
+                `🤖 <b>HOZOO MD TikTok Bot v2.2 VPS</b>\n\n` +
+                `Commands:\n` +
+                `/profile &lt;username&gt; - Get user info\n` +
+                `/video &lt;id&gt; - Get video info\n` +
+                `/trending - Trending videos\n` +
+                `/id - Your Telegram ID\n` +
+                `/stats - Bot stats\n` +
+                `/files - List scanned files`
+            );
+            return;
+        }
+
+        if (text.startsWith('/id')) {
+            await this.sendMessage(chatId, `Your ID: <code>${userId}</code>\nChat ID: <code>${chatId}</code>`);
+            return;
+        }
+
+        if (text.startsWith('/stats')) {
+            await this.sendMessage(chatId,
+                `📊 <b>Bot Stats</b>\n` +
+                `Uptime: ${Math.floor(process.uptime())}s\n` +
+                `Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB\n` +
+                `Platform: ${process.platform}\n` +
+                `Node: ${process.version}\n` +
+                `PID: ${process.pid}`
+            );
+            return;
+        }
+
+        if (text.startsWith('/files')) {
+            const scanned = VpsConfig.scanFiles(VpsConfig.tiktokDir());
+            let msg = `📂 <b>Files in ~/tiktok#</b>\n\n`;
+            msg += `JS: ${scanned.jsFiles.length}\n`;
+            msg += `PY: ${scanned.pyFiles.length}\n`;
+            msg += `TXT: ${scanned.txtFiles.length}\n\n`;
+            msg += `Order: JS → PY → TXT → JSON\n\n`;
+            const list = scanned.order.slice(0, 20).map((f, i) => `${i + 1}. ${path.basename(f)}`).join('\n');
+            msg += `<code>${list}</code>`;
+            await this.sendMessage(chatId, msg);
+            return;
+        }
+
+        if (text.startsWith('/profile')) {
+            const username = text.split(' ')[1];
+            if (!username) {
+                await this.sendMessage(chatId, 'Usage: /profile <username>');
+                return;
+            }
+            await this.sendMessage(chatId, '⏳ Fetching...');
+            const result = await tiktokClient.getProfile(username);
+            if (!result.success) {
+                await this.sendMessage(chatId, `❌ Error: ${result.error || 'not found'}`);
+                return;
+            }
+            const u = result.user;
+            const s = result.stats;
+            await this.sendMessage(chatId,
+                `👤 <b>@${u.uniqueId}</b>\n` +
+                `Name: ${u.nickname}\n` +
+                `Verified: ${u.verified ? '✅' : '❌'}\n` +
+                `Followers: ${s.followerCount || 0}\n` +
+                `Following: ${s.followingCount || 0}\n` +
+                `Likes: ${s.heartCount || 0}\n` +
+                `Videos: ${s.videoCount || 0}\n` +
+                `Signature: ${u.signature || '-'}`
+            );
+            return;
+        }
+
+        if (text.startsWith('/video')) {
+            const videoId = text.split(' ')[1];
+            if (!videoId) {
+                await this.sendMessage(chatId, 'Usage: /video <id>');
+                return;
+            }
+            await this.sendMessage(chatId, '⏳ Fetching...');
+            const result = await tiktokClient.getVideo(videoId);
+            if (!result.success) {
+                await this.sendMessage(chatId, `❌ Error: ${result.error}`);
+                return;
+            }
+            const item = result.item;
+            await this.sendMessage(chatId,
+                `🎬 <b>${item.desc || 'No description'}</b>\n` +
+                `Author: @${item.author?.uniqueId || '-'}\n` +
+                `Likes: ${item.stats?.diggCount || 0}\n` +
+                `Comments: ${item.stats?.commentCount || 0}\n` +
+                `Shares: ${item.stats?.shareCount || 0}\n` +
+                `Views: ${item.stats?.playCount || 0}`
+            );
+            return;
+        }
+
+        if (text.startsWith('/trending')) {
+            await this.sendMessage(chatId, '⏳ Fetching trending...');
+            const result = await tiktokClient.getTrending();
+            if (!result.success) {
+                await this.sendMessage(chatId, `❌ Error: ${result.error}`);
+                return;
+            }
+            const items = result.items.slice(0, 10);
+            let msg = '🔥 <b>Trending Videos</b>\n\n';
+            items.forEach((item, i) => {
+                msg += `${i + 1}. @${item.author?.uniqueId || '-'} - ${(item.desc || '').substring(0, 50)}\n`;
+            });
+            await this.sendMessage(chatId, msg);
+            return;
+        }
+
+        if (text && !text.startsWith('/')) {
+            const username = text.replace('@', '');
+            const result = await tiktokClient.getProfile(username);
+            if (result.success) {
+                const u = result.user;
+                const s = result.stats;
+                await this.sendMessage(chatId,
+                    `👤 <b>@${u.uniqueId}</b>\n` +
+                    `Followers: ${s.followerCount || 0} | Likes: ${s.heartCount || 0}`
+                );
+            } else {
+                await this.sendMessage(chatId, `❌ Not found: ${username}`);
+            }
+        }
+    }
+
+    async start(tiktokClient, ownerChatId) {
+        this.running = true;
+        console.log('[TG] Bot started polling');
+
+        // Notif ke owner pas bot nyala
+        if (ownerChatId) {
+            try {
+                await this.sendMessage(ownerChatId,
+                    `✅ <b>HOZOO MD Bot Started</b>\n\n` +
+                    `Platform: ${process.platform}\n` +
+                    `Node: ${process.version}\n` +
+                    `PID: ${process.pid}\n` +
+                    `Dir: ~/tiktok#\n\n` +
+                    `Bot lo udah nyala, Rajaku 👑`
+                );
+            } catch (e) {
+                console.error('[TG] Failed to notify owner:', e.message);
+            }
+        }
+
+        while (this.running) {
+            try {
+                const res = await this.getUpdates();
+                if (!res.ok) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    continue;
+                }
+                for (const update of res.result) {
+                    this.offset = update.update_id + 1;
+                    try {
+                        await this.handleUpdate(update, tiktokClient);
+                    } catch (e) {
+                        console.error('[TG] handleUpdate error:', e.message);
+                    }
+                }
+            } catch (e) {
+                console.error('[TG] poll error:', e.message);
+                await new Promise(r => setTimeout(r, 5000));
+            }
+        }
+    }
+
+    stop() { this.running = false; }
+}
+
+// ============================================================
+// SECTION 8: ANTI-DETECTION WRAPPER
+// ============================================================
+
+class AntiDetection {
+    static init() {
+        try {
+            process.title = 'node';
+            global.__DEBUGGER__ = false;
+
+            const fakeArgv = ['node', 'index.js'];
+            try {
+                Object.defineProperty(process, 'argv', {
+                    get: () => fakeArgv,
+                    configurable: true
+                });
+            } catch (e) {}
+
+            try {
+                if (process.platform === 'linux') {
+                    const procCmdline = '/proc/self/cmdline';
+                    if (fs.existsSync(procCmdline)) {
+                        fs.writeFileSync(procCmdline, 'node\x00index.js\x00');
+                    }
+                }
+            } catch (e) {}
+
+            const sensitive = ['BOT_TOKEN', 'API_HASH', 'API_ID'];
+            for (const k of sensitive) {
+                if (process.env[k]) {
+                    try {
+                        Object.defineProperty(process.env, k, {
+                            value: process.env[k],
+                            enumerable: false,
+                            configurable: true
+                        });
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+    }
+
+    static fakeCrash() {
+        try {
+            const start = Date.now();
+            debugger;
+            if (Date.now() - start > 100) {
+                console.log('[ERROR] Module load failed: ENOENT');
+            }
+        } catch (e) {}
+    }
+}
+
+// ============================================================
+// SECTION 9: MAIN ORCHESTRATOR (VPS EDITION v2.2)
+// ============================================================
+
+class HozooBot {
+    constructor(config) {
+        this.config = config;
+        this.hider = new FileHider();
+        this.proxyManager = null;
+        this.cookieLoader = null;
+        this.tokenManager = null;
+        this.httpClient = null;
+        this.tiktokClient = null;
+        this.telegramBot = null;
+    }
+
+    init() {
+        AntiDetection.init();
+        AntiDetection.fakeCrash();
+
+        console.log('[HOZOO] Initializing VPS Edition v2.2...');
+        console.log(`[HOZOO] Platform: ${process.platform} | Node: ${process.version}`);
+
+        if (this.config.proxyFile) {
+            this.proxyManager = new ProxyManager(this.hider, this.config.proxyFile);
+            console.log(`[HOZOO] Proxies loaded: ${this.proxyManager.count()}`);
+        } else {
+            this.proxyManager = new ProxyManager(this.hider, null);
+            console.log('[HOZOO] No proxy file, direct connection');
+        }
+
+        if (this.config.cookieFile) {
+            this.cookieLoader = new CookieLoader(this.hider, this.config.cookieFile);
+            console.log(`[HOZOO] Cookies loaded: ${this.cookieLoader.count()}`);
+        } else {
+            this.cookieLoader = new CookieLoader(this.hider, null);
+            console.log('[HOZOO] No cookie file');
+        }
+
+        if (this.config.tokenFile) {
+            this.tokenManager = new TokenManager(this.hider, this.config.tokenFile);
+            console.log('[HOZOO] Tokens loaded');
+        } else {
+            this.tokenManager = new TokenManager(this.hider, null);
+        }
+
+        this.httpClient = new HttpClient(this.proxyManager, this.cookieLoader);
+        this.tiktokClient = new TikTokClient(this.httpClient);
+
+        const botToken = this.tokenManager.botToken();
+        const adminId = this.tokenManager.adminId();
+        const ownerChatId = this.tokenManager.ownerChatId();
+
+        if (!botToken) {
+            throw new Error('BOT_TOKEN tidak ditemukan di ~/tiktok#/ atau env');
+        }
+
+        this.telegramBot = new TelegramBot(botToken, adminId || PRELOADED.ADMIN_ID);
+        this.ownerChatId = ownerChatId || PRELOADED.OWNER_CHAT_ID;
+
+        console.log('[HOZOO] All systems ready 🚀');
+    }
+
+    async start() {
+        this.init();
+
+        const shutdown = () => {
+            console.log('\n[HOZOO] Shutting down...');
+            if (this.telegramBot) this.telegramBot.stop();
+            this.hider.restoreAll();
+            setTimeout(() => process.exit(0), 1000);
+        };
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+
+        await this.telegramBot.start(this.tiktokClient, this.ownerChatId);
+    }
+}
+
+// ============================================================
+// SECTION 10: BOOTSTRAP VPS EDITION v2.2
+// Prioritas: JS dulu → PY → TXT → JSON
+// ============================================================
+
+if (require.main === module) {
+    // 1. Inject credential preloaded (token & chat ID lo)
+    VpsConfig.injectPreloaded();
+
+    // 2. Resolve & ensure folder
+    const tiktokDir = VpsConfig.ensureDir(VpsConfig.tiktokDir());
+    console.log(`[HOZOO] Config directory: ${tiktokDir}`);
+
+    // 3. Load .env di folder tiktok kalo ada
+    const envPath = path.join(tiktokDir, '.env');
+    const envVars = VpsConfig.loadEnvFile(envPath);
+    for (const [k, v] of Object.entries(envVars)) {
+        if (!process.env[k]) process.env[k] = v;
+    }
+
+    // 4. Scan folder — PRIORITAS JS DULU, baru PY
+    const scanned = VpsConfig.scanFiles(tiktokDir);
+    console.log(`[HOZOO] Total files found: ${scanned.all.length}`);
+    console.log(`[HOZOO] JS files: ${scanned.jsFiles.length}`);
+    console.log(`[HOZOO] PY files: ${scanned.pyFiles.length}`);
+    console.log(`[HOZOO] TXT files: ${scanned.txtFiles.length}`);
+
+    // 5. Log urutan load
+    console.log('[HOZOO] Load order (JS first → PY → TXT):');
+    scanned.order.slice(0, 30).forEach((f, i) => {
+        console.log(`  ${i + 1}. ${path.basename(f)}`);
+    });
+
+    // 6. Config mapping — env var menang, fallback ke scan
+    const config = {
+        proxyFile: process.env.PROXY_FILE || scanned.proxy,
+        cookieFile: process.env.COOKIE_FILE || scanned.cookie,
+        tokenFile: process.env.TOKEN_FILE || scanned.token
+    };
+
+    console.log('[HOZOO] Config mapping:');
+    console.log(`  proxy  -> ${config.proxyFile || '(none)'}`);
+    console.log(`  cookie -> ${config.cookieFile || '(none)'}`);
+    console.log(`  token  -> ${config.tokenFile || '(none - using preloaded)'}`);
+
+    const bot = new HozooBot(config);
+
+    bot.start().catch(err => {
+        console.error('[HOZOO] Fatal:', err.message);
+        process.exit(1);
+    });
+
+    // Keep alive + heartbeat
+    setInterval(() => {
+        try {
+            const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+            if (mem > 500) console.log(`[HOZOO] High memory: ${mem}MB`);
+        } catch (e) {}
+    }, 60000);
+}
+
+module.exports = {
+    HozooBot, FileHider, ProxyManager, CookieLoader, TokenManager,
+    HttpClient, TikTokClient, TelegramBot, AntiDetection, VpsConfig, PRELOADED
+};
